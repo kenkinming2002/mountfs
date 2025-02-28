@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 
+#include <assert.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -108,30 +109,201 @@ static int process_option(void *data, const char *arg, int key, struct fuse_args
   }
 }
 
-static char *resolve_path(const char *path)
+static int mount_compar(const void *a, const void *b)
 {
-  // If this resolve back to ourself, we are doomed
+  const struct mount *mnt1 = a;
+  const struct mount *mnt2 = b;
+  return strlen(mnt1->target) - strlen(mnt2->target);
+}
 
-  for(size_t i=0; i<options.mounts.count; ++i)
+/// Compute the relative path of child from parent. The returned path always
+/// consist of a leading directory separator even if parent == child.
+///
+/// For example:
+///   path_relative("/", "/")  => "/"
+///   path_relative("/", "/a")  => "/a"
+///   path_relative("/a", "/a")  => "/"
+///   path_relative("/a/b", "/a")  => "/b"
+///   path_relative("/a/b/c", "/a")  => "/b/c"
+///   path_relative("/aa/b/c", "/a") => NULL
+///
+/// This can be used detect if a path is under a mountpoint.
+static const char *path_resolve_relative(const char *parent, const char *child)
+{
+  size_t n = strcmp(parent, "/") != 0 ? strlen(parent) : 0;
+  if(strncmp(parent, child, n) != 0)
+    return NULL;
+
+  switch(child[n])
+  {
+  case '\0':
+    return "/";
+  case '/':
+    return &child[n];
+  default:
+    return NULL;
+  }
+}
+
+/// Similar to path_relative, but child must be a immediate child of parent. The
+/// returned string is guaranteed to consist of no directory separator.
+///
+/// For example:
+///   path_relative_component("/", "/")  => NULL
+///   path_relative_component("/", "/a")  => "a"
+///   path_relative_component("/a", "/a")  => NULL
+///   path_relative_component("/a/b", "/a")  => "b"
+///   path_relative_component("/a/b/c", "/a")  => NULL
+///   path_relative_component("/aa/b/c", "/a") => NULL
+///
+/// This can be used detect if child is inside parent directory.
+static const char *path_resolve_relative_component(const char *parent, const char *child)
+{
+  size_t n = strcmp(parent, "/") != 0 ? strlen(parent) : 0;
+  if(strncmp(parent, child, n) != 0)
+    return NULL;
+
+  switch(child[n])
+  {
+  case '\0':
+    return NULL;
+  case '/':
+    if(child[n+1] == '\0')
+      return NULL;
+
+    if(strchr(&child[n+1], '/'))
+      return NULL;
+
+    return &child[n+1];
+  default:
+    return NULL;
+  }
+}
+
+static const char *path_resolve(const char *path, char buffer[PATH_MAX+1])
+{
+  // We loop in reverse because mounts are sorted by target length in ascending
+  // order, and we only cares about the longest match
+  for(size_t i=options.mounts.count-1; i<options.mounts.count; ++i)
   {
     struct mount *mount = &options.mounts.items[i];
-
-    size_t n = strlen(mount->target);
-    if(strncmp(path, mount->target, n) != 0)
+    const char *rest = path_resolve_relative(mount->target, path);
+    if(!rest)
       continue;
 
-    char *new_path;
-    if(asprintf(&new_path, "%s%s", mount->source, path + n) == -1)
+    if(snprintf(buffer, PATH_MAX+1, "%s%s", mount->source, rest) > PATH_MAX)
     {
-      errno = ENOMEM;
+      errno = ENAMETOOLONG;
       return NULL;
     }
-    fprintf(stderr, "resolved path %s -> %s\n", path, new_path);
-    return new_path;
+
+    fprintf(stderr, "resolved path: %s -> %s\n", path, buffer);
+    return buffer;
   }
+
   fprintf(stderr, "resolved path %s -> %s\n", path, path);
-  return strdup(path);
+  return path;
 }
+
+static bool path_may_synthesize(const char *path)
+{
+  for(size_t i=0; i<options.mounts.count; --i)
+  {
+    const struct mount *mount = &options.mounts.items[i];
+    if(path_resolve_relative(path, mount->target))
+      return true;
+  }
+  return false;
+}
+
+#define SYNTHETIC_FH (uint64_t)-1
+
+#define resolve_and_call_ext(expr, path, action)            \
+  do {                                                      \
+    const char *saved_path = path;                          \
+                                                            \
+    char buffer[PATH_MAX+1];                                \
+    if(!(path = path_resolve(path, buffer)))                \
+      return -errno;                                        \
+                                                            \
+    int result = (expr);                                    \
+    if(result != -1)                                        \
+      return 0;                                             \
+                                                            \
+    if(errno == ENOENT && path_may_synthesize(saved_path))  \
+      action;                                               \
+                                                            \
+    return -errno;                                          \
+  } while(0)
+
+#define resolve_and_call2_ext(expr, path1, path2, action)       \
+  do {                                                      \
+    const char *saved_path1 = path1;                        \
+    const char *saved_path2 = path2;                        \
+                                                            \
+    char buffer1[PATH_MAX+1];                               \
+    if(!(path1 = path_resolve(path1, buffer1)))             \
+      return -errno;                                        \
+                                                            \
+    char buffer2[PATH_MAX+1];                               \
+    if(!(path2 = path_resolve(path2, buffer2)))             \
+      return -errno;                                        \
+                                                            \
+    int result = (expr);                                    \
+    if(result != -1)                                        \
+      return 0;                                             \
+                                                            \
+    if(errno == ENOENT && path_may_synthesize(saved_path1)) \
+      action;                                               \
+                                                            \
+    return -errno;                                          \
+  } while(0)
+
+#define resolve_and_call(expr, path) resolve_and_call_ext(expr, path, return -ENOTSUP)
+#define resolve_and_call2(expr, path1, path2) resolve_and_call2_ext(expr, path1, path2, return -ENOTSUP)
+
+#define resolve_and_call_protected(expr, path) \
+  do {                                         \
+    if(path_may_synthesize(path))              \
+      return -ENOTSUP;                         \
+                                               \
+    char buffer[PATH_MAX+1];                   \
+    if(!(path = path_resolve(path, buffer)))   \
+      return -errno;                           \
+                                               \
+    int result = (expr);                       \
+    if(result != -1)                           \
+      return 0;                                \
+                                               \
+    return -errno;                             \
+  } while(0)
+
+#define resolve_and_call2_protected(expr, path1, path2)     \
+  do {                                                      \
+    if(path_may_synthesize(path1))                          \
+      return -ENOTSUP;                                      \
+                                                            \
+    if(path_may_synthesize(path2))                          \
+      return -ENOTSUP;                                      \
+                                                            \
+    char buffer1[PATH_MAX+1];                               \
+    if(!(path1 = path_resolve(path1, buffer1)))             \
+      return -errno;                                        \
+                                                            \
+    char buffer2[PATH_MAX+1];                               \
+    if(!(path2 = path_resolve(path2, buffer2)))             \
+      return -errno;                                        \
+                                                            \
+    int result = (expr);                                    \
+    if(result != -1)                                        \
+      return 0;                                             \
+                                                            \
+    return -errno;                                          \
+  } while(0)
+
+///////////////////////
+/// Init or destroy ///
+///////////////////////
 
 static void *mountfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
@@ -140,77 +312,108 @@ static void *mountfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
   return NULL;
 }
 
-static int mountfs_do_open(const char *path, struct fuse_file_info *fi)
-{
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    goto err;
-
-  int fd = open(new_path, fi->flags);
-  if(fd == -1)
-    goto err_free_path;
-
-  free(new_path);
-  fi->fh = fd;
-  return 0;
-
-err_free_path:
-  free(new_path);
-err:
-  return -errno;
-}
+///////////////////////////////
+/// Open or release handles ///
+///////////////////////////////
 
 static int mountfs_open(const char *path, struct fuse_file_info *fi)
 {
-  char *new_path = resolve_path(path);
-  if(!new_path)
+  if(path_may_synthesize(path))
+    return -EEXIST;
+
+  char buffer[PATH_MAX+1];
+  if(!(path = path_resolve(path, buffer)))
     return -errno;
 
-  int fd = open(new_path, fi->flags);
-  free(new_path);
-  if(fd != -1)
-  {
-    fi->fh = fd;
-    return 0;
-  }
-  else
+  int fd = open(path, fi->flags);
+  if(fd == -1)
     return -errno;
+
+  fi->fh = fd;
+  return 0;
+}
+
+static int mountfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+  if(path_may_synthesize(path))
+    return -EEXIST;
+
+  char buffer[PATH_MAX+1];
+  if(!(path = path_resolve(path, buffer)))
+    return -errno;
+
+  int fd = open(path, fi->flags, mode);
+  if(fd == -1)
+    return -errno;
+
+  fi->fh = fd;
+  return 0;
 }
 
 static int mountfs_opendir(const char *path, struct fuse_file_info *fi)
 {
-  char *new_path = resolve_path(path);
-  if(!new_path)
+  char buffer[PATH_MAX+1];
+  const char *resolved_path = path_resolve(path, buffer);
+  if(!resolved_path)
     return -errno;
 
-  int fd = open(new_path, fi->flags | O_DIRECTORY);
-  free(new_path);
+  int fd = open(resolved_path, fi->flags | O_DIRECTORY);
   if(fd != -1)
   {
     fi->fh = fd;
     return 0;
   }
-  else
-    return -errno;
+
+  if(errno == ENOENT && path_may_synthesize(path))
+  {
+    fi->fh = SYNTHETIC_FH;
+    return 0;
+  }
+
+  return -errno;
 }
 
-static int mountfs_do_release(const char *path, struct fuse_file_info *fi)
+static int mountfs_release(const char *path, struct fuse_file_info *fi)
 {
   return close(fi->fh) != -1 ? 0 : -errno;
 }
 
+static int mountfs_releasedir(const char *path, struct fuse_file_info *fi)
+{
+  if(fi->fh != SYNTHETIC_FH)
+    return 0;
+
+  return close(fi->fh) != -1 ? 0 : -errno;
+}
+
+/////////////////////////////////////
+/// Acts on paths or file handles ///
+/////////////////////////////////////
+
 static int mountfs_getattr(const char *path, struct stat *statbuf, struct fuse_file_info *fi)
 {
   if(!fi)
-  {
-    char *new_path = resolve_path(path);
-    if(!new_path)
-      return -errno;
+    resolve_and_call_ext(lstat(path, statbuf), path, {
+        memset(statbuf, 0, sizeof *statbuf);
 
-    int result = lstat(new_path, statbuf);
-    free(new_path);
-    return result != -1 ? 0 : -errno;
-  }
+        statbuf->st_mode = S_IFDIR | S_IRWXU;
+        statbuf->st_nlink = 1;
+        statbuf->st_uid = getuid();
+        statbuf->st_gid = getgid();
+        statbuf->st_size = 0;
+        statbuf->st_blksize = 1024;
+        statbuf->st_blocks = 0;
+
+        struct timespec timespec;
+        if(clock_gettime(CLOCK_REALTIME, &timespec) == -1)
+          return -errno;
+
+        statbuf->st_atim = timespec;
+        statbuf->st_mtim = timespec;
+        statbuf->st_ctim = timespec;
+
+        return 0;
+    });
   else
     return fstat(fi->fh, statbuf) != -1 ? 0 : -errno;
 
@@ -219,15 +422,7 @@ static int mountfs_getattr(const char *path, struct stat *statbuf, struct fuse_f
 static int mountfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
   if(!fi)
-  {
-    char *new_path = resolve_path(path);
-    if(!new_path)
-      return -errno;
-
-    int result = lchmod(new_path, mode);
-    free(new_path);
-    return result != -1 ? 0 : -errno;
-  }
+    resolve_and_call(lchmod(path, mode), path);
   else
     return fchmod(fi->fh, mode) != -1 ? 0 : -errno;
 }
@@ -235,127 +430,109 @@ static int mountfs_chmod(const char *path, mode_t mode, struct fuse_file_info *f
 static int mountfs_chown(const char *path, uid_t owner, gid_t group, struct fuse_file_info *fi)
 {
   if(!fi)
-  {
-    char *new_path = resolve_path(path);
-    if(!new_path)
-      return -errno;
-
-    int result = lchown(new_path, owner, group);
-    free(new_path);
-    return result != -1 ? 0 : -errno;
-  }
+    resolve_and_call(lchown(path, owner, group), path);
   else
     return fchown(fi->fh, owner, group) != -1 ? 0 : -errno;
 }
 
-static int mountfs_setxattr(const char *path, const char *name, const char *value, size_t size, int flags)
+static int mountfs_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi)
 {
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int result = lsetxattr(new_path, name, value, size, flags);
-  free(new_path);
-  return result != -1 ? 0 : -errno;
-}
-
-static int mountfs_getxattr(const char *path, const char *name, char *value, size_t size)
-{
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int result = lgetxattr(new_path, name, value, size);
-  free(new_path);
-  return result != -1 ? 0 : -errno;
-}
-
-static int mountfs_listxattr(const char *path, char *list, size_t size)
-{
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int result = llistxattr(new_path, list, size);
-  free(new_path);
-  return result != -1 ? 0 : -errno;
-}
-
-static int mountfs_removexattr(const char *path, const char *name)
-{
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int result = lremovexattr(new_path, name);
-  free(new_path);
-  return result != -1 ? 0 : -errno;
-}
-
-static int mountfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
-{
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int fd = open(path, fi->flags, mode);
-  free(new_path);
-  if(fd != -1)
-  {
-    fi->fh = fd;
-    return 0;
-  }
+  if(!fi)
+    resolve_and_call(utimensat(AT_FDCWD, path, tv, AT_SYMLINK_NOFOLLOW), path);
   else
-    return -errno;
-}
-
-static int mountfs_mknod(const char *path, mode_t mode, dev_t dev)
-{
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int result = S_ISFIFO(mode) ? mkfifo(new_path, mode) : mknod(new_path, mode, dev);
-  free(new_path);
-  return result;
-}
-
-static int mountfs_mkdir(const char *path, mode_t mode)
-{
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int result = mkdir(new_path, mode);
-  free(new_path);
-  return result;
-}
-
-static int mountfs_rmdir(const char *path)
-{
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int result = rmdir(new_path);
-  free(new_path);
-  return result;
+    return futimens(fi->fh, tv) != -1 ? 0 : -errno;
 }
 
 static int mountfs_truncate(const char *path, off_t length, struct fuse_file_info *fi)
 {
   if(!fi)
-  {
-    char *new_path = resolve_path(path);
-    if(!new_path)
-      return -errno;
-
-    int result = truncate(new_path, length);
-    free(new_path);
-    return result != -1 ? 0 : -errno;
-  }
+    resolve_and_call(truncate(path, length), path);
   else
     return ftruncate(fi->fh, length) != -1 ? 0 : -errno;
+}
+
+//////////////////////////
+/// Acts on paths only ///
+//////////////////////////
+
+static int mountfs_setxattr(const char *path, const char *name, const char *value, size_t size, int flags)
+{
+  resolve_and_call(lsetxattr(path, name, value, size, flags), path);
+}
+
+static int mountfs_getxattr(const char *path, const char *name, char *value, size_t size)
+{
+  resolve_and_call(lgetxattr(path, name, value, size), path);
+}
+
+static int mountfs_listxattr(const char *path, char *list, size_t size)
+{
+  resolve_and_call(llistxattr(path, list, size), path);
+}
+
+static int mountfs_removexattr(const char *path, const char *name)
+{
+  resolve_and_call(lremovexattr(path, name), path);
+}
+
+static int mountfs_link(const char *oldpath, const char *newpath)
+{
+  resolve_and_call2(link(oldpath, newpath), oldpath, newpath);
+}
+
+static int readlink_wrapper(const char *path, char *buf, size_t count)
+{
+  ssize_t n = readlink(path, buf, count-1);
+  if(n == -1)
+    return -1;
+
+  buf[n] = '\0';
+  return 0;
+}
+
+static int mountfs_readlink(const char *path, char *buf, size_t count)
+{
+  resolve_and_call(readlink_wrapper(path, buf, count), path);
+}
+
+static int mountfs_symlink(const char *target, const char *linkpath)
+{
+  resolve_and_call(symlink(target, linkpath), linkpath);
+}
+
+static int mountfs_unlink(const char *path)
+{
+  resolve_and_call_protected(unlink(path), path);
+}
+
+static int mountfs_rename(const char *oldpath, const char *newpath, unsigned int flags)
+{
+  resolve_and_call2_protected(renameat2(AT_FDCWD, oldpath, AT_FDCWD, newpath, flags), oldpath, newpath);
+}
+
+static int mountfs_mknod(const char *path, mode_t mode, dev_t dev)
+{
+  resolve_and_call_protected(S_ISFIFO(mode) ? mkfifo(path, mode) : mknod(path, mode, dev), path);
+}
+
+static int mountfs_mkdir(const char *path, mode_t mode)
+{
+  resolve_and_call_protected(mkdir(path, mode), path);
+}
+
+static int mountfs_rmdir(const char *path)
+{
+  resolve_and_call_protected(rmdir(path), path);
+}
+
+/////////////////////////////////
+/// Acts on file handles only ///
+/////////////////////////////////
+
+static ssize_t mountfs_copy_file_range(const char *path_in, struct fuse_file_info *fi_in, off_t offset_in, const char *path_out, struct fuse_file_info *fi_out, off_t offset_out, size_t size, int flags)
+{
+  ssize_t result = copy_file_range(fi_in->fh, &offset_in, fi_out->fh, &offset_out, size, flags);
+  return result != -1 ? result : -errno;
 }
 
 static int mountfs_fallocate(const char *path, int mode, off_t offset, off_t length, struct fuse_file_info *fi)
@@ -363,75 +540,22 @@ static int mountfs_fallocate(const char *path, int mode, off_t offset, off_t len
   return fallocate(fi->fh, mode, offset, length) != -1 ? 0 : -errno;
 }
 
-static int mountfs_link(const char *oldpath, const char *newpath)
+static int mountfs_flock(const char *path, struct fuse_file_info *fi, int op)
 {
-  char *new_oldpath = resolve_path(oldpath);
-  if(!new_oldpath)
-    return -errno;
-
-  char *new_newpath = resolve_path(newpath);
-  if(!new_newpath)
-  {
-    free(new_oldpath);
-    return -errno;
-  }
-
-  int result = link(new_oldpath, new_newpath);
-  free(new_oldpath);
-  free(new_newpath);
-  return result;
+  return flock(fi->fh, op) != -1 ? 0 : -errno;
 }
 
-static int mountfs_unlink(const char *path)
+static int mountfs_flush(const char *path, struct fuse_file_info *fi)
 {
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int result = unlink(new_path);
-  free(new_path);
-  return result;
+  return close(dup(fi->fh)) != -1 ? 0 : -errno;
 }
 
-static int mountfs_rename(const char *oldpath, const char *newpath, unsigned int flags)
+static int mountfs_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 {
-  char *new_oldpath = resolve_path(oldpath);
-  if(!new_oldpath)
-    return -errno;
-
-  char *new_newpath = resolve_path(newpath);
-  if(!new_newpath)
-  {
-    free(new_oldpath);
-    return -errno;
-  }
-
-  int result = renameat2(AT_FDCWD, new_oldpath, AT_FDCWD, new_newpath, flags);
-  free(new_oldpath);
-  free(new_newpath);
-  return result;
-}
-
-static int mountfs_symlink(const char *target, const char *linkpath)
-{
-  char *new_linkpath = resolve_path(linkpath);
-  if(!new_linkpath)
-    return -errno;
-
-  int result = symlink(target, linkpath);
-  free(new_linkpath);
-  return result;
-}
-
-static int mountfs_readlink(const char *path, char *buf, size_t count)
-{
-  char *new_path = resolve_path(path);
-  if(!new_path)
-    return -errno;
-
-  int result = readlink(new_path, buf, count);
-  free(new_path);
-  return result != -1 ? 0 : -errno;
+  if(datasync)
+    return fdatasync(fi->fh) != -1 ? 0 : -errno;
+  else
+    return fsync(fi->fh) != -1 ? 0 : -errno;
 }
 
 static off_t mountfs_lseek(const char *path, off_t off, int whence, struct fuse_file_info *fi)
@@ -443,12 +567,6 @@ static off_t mountfs_lseek(const char *path, off_t off, int whence, struct fuse_
 static int mountfs_read(const char *path, char *buf, size_t count, off_t offset, struct fuse_file_info *fi)
 {
   ssize_t result = pread(fi->fh, buf, count, offset);
-  return result != -1 ? result : -errno;
-}
-
-static int mountfs_write(const char *path, const char *buf, size_t count, off_t offset, struct fuse_file_info *fi)
-{
-  ssize_t result = pwrite(fi->fh, buf, count, offset);
   return result != -1 ? result : -errno;
 }
 
@@ -465,6 +583,12 @@ static int mountfs_read_buf(const char *path, struct fuse_bufvec **bufp, size_t 
   return 0;
 }
 
+static int mountfs_write(const char *path, const char *buf, size_t count, off_t offset, struct fuse_file_info *fi)
+{
+  ssize_t result = pwrite(fi->fh, buf, count, offset);
+  return result != -1 ? result : -errno;
+}
+
 static int mountfs_write_buf(const char *path, struct fuse_bufvec *buf, off_t offset, struct fuse_file_info *fi)
 {
   struct fuse_bufvec dst = FUSE_BUFVEC_INIT(fuse_buf_size(buf));
@@ -474,43 +598,40 @@ static int mountfs_write_buf(const char *path, struct fuse_bufvec *buf, off_t of
   return fuse_buf_copy(&dst, buf, FUSE_BUF_SPLICE_NONBLOCK);
 }
 
-static ssize_t mountfs_copy_file_range(const char *path_in, struct fuse_file_info *fi_in, off_t offset_in, const char *path_out, struct fuse_file_info *fi_out, off_t offset_out, size_t size, int flags)
-{
-  ssize_t result = copy_file_range(fi_in->fh, &offset_in, fi_out->fh, &offset_out, size, flags);
-  return result != -1 ? result : -errno;
-}
+//////////////////////////////////////
+/// Acts on directory handles only ///
+//////////////////////////////////////
 
 static int mountfs_readdir(const char *path, void *buf, fuse_fill_dir_t fill_dir, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags)
 {
-  int fd = fi->fh;
-
-  char buffer[1024];
-  long n;
-  while((n = syscall(SYS_getdents, fd, buffer, sizeof buffer)) > 0)
+  if(fi->fh != SYNTHETIC_FH)
   {
-    struct linux_dirent
-    {
-      unsigned long  d_ino;
-      off_t          d_off;
-      unsigned short d_reclen;
-      char           d_name[];
-    };
+    DIR *dirp = fdopendir(fi->fh);
+    if(!dirp)
+      return -errno;
 
-    for(struct linux_dirent *
-        dirent = (struct linux_dirent *)buffer;
-        dirent < (struct linux_dirent *)(buffer + n);
-        dirent = (struct linux_dirent *)((char *)dirent + dirent->d_reclen))
+    errno = 0;
+
+    struct dirent *dirent;
+    while((dirent = readdir(dirp)))
       fill_dir(buf, dirent->d_name, NULL, 0, 0);
+
+    if(errno != 0)
+      return -errno;
   }
-  return n != -1 ? 0 : -errno;
+
+  for(size_t i=0; i<options.mounts.count; ++i)
+  {
+    struct mount *mount = &options.mounts.items[i];
+    const char *name = path_resolve_relative_component(path, mount->target);
+    if(name)
+      fill_dir(buf, name, NULL, 0, 0);
+  }
+
+  return 0;
 }
 
-static int mountfs_flush(const char *path, struct fuse_file_info *fi)
-{
-  return close(dup(fi->fh)) != -1 ? 0 : -errno;
-}
-
-static int mountfs_do_fsync(const char *path, int datasync, struct fuse_file_info *fi)
+static int mountfs_fsyncdir(const char *path, int datasync, struct fuse_file_info *fi)
 {
   if(datasync)
     return fdatasync(fi->fh) != -1 ? 0 : -errno;
@@ -518,95 +639,59 @@ static int mountfs_do_fsync(const char *path, int datasync, struct fuse_file_inf
     return fsync(fi->fh) != -1 ? 0 : -errno;
 }
 
-static int mountfs_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi)
-{
-  if(!fi)
-  {
-    char *new_path = resolve_path(path);
-    if(!new_path)
-      return -errno;
-
-    int result = utimensat(AT_FDCWD, new_path, tv, AT_SYMLINK_NOFOLLOW);
-    free(new_path);
-    return result != -1 ? 0 : -errno;
-  }
-  else
-    return futimens(fi->fh, tv) != -1 ? 0 : -errno;
-}
-
-static int mountfs_flock(const char *path, struct fuse_file_info *fi, int op)
-{
-  return flock(fi->fh, op) != -1 ? 0 : -errno;
-}
-
 static struct fuse_operations mountfs_fops = {
-    .init = mountfs_init,
-    .destroy = NULL,
+  // Init or destroy
+  .init = mountfs_init,
+  .destroy = NULL,
 
-    // Open
-    .open = mountfs_open,
-    .opendir = mountfs_opendir,
+  // Open and release handles
+  .open = mountfs_open,
+  .opendir = mountfs_opendir,
+  .release = mountfs_release,
+  .releasedir = mountfs_releasedir,
 
-    // Release
-    .release = mountfs_do_release,
-    .releasedir = mountfs_do_release,
+  // Acts on paths or file handles
+  .getattr = mountfs_getattr,
+  .chmod = mountfs_chmod,
+  .chown = mountfs_chown,
+  .utimens = mountfs_utimens,
+  .truncate = mountfs_truncate,
 
-    // Attributes
-    .getattr = mountfs_getattr,
-    .chmod = mountfs_chmod,
-    .chown = mountfs_chown,
+  // Acts on paths only
+  .setxattr = mountfs_setxattr,
+  .getxattr = mountfs_getxattr,
+  .listxattr = mountfs_listxattr,
+  .removexattr = mountfs_removexattr,
+  .link = mountfs_link,
+  .unlink = mountfs_unlink,
+  .rename = mountfs_rename,
+  .readlink = mountfs_readlink,
+  .symlink = mountfs_symlink,
+  .create = mountfs_create,
+  .mknod = mountfs_mknod,
+  .mkdir = mountfs_mkdir,
+  .rmdir = mountfs_rmdir,
 
-    // Extended attributes
-    .setxattr = mountfs_setxattr,
-    .getxattr = mountfs_getxattr,
-    .listxattr = mountfs_listxattr,
-    .removexattr = mountfs_removexattr,
+  // Acts on file handles only
+  .copy_file_range = mountfs_copy_file_range,
+  .fallocate = mountfs_fallocate,
+  .flock = mountfs_flock,
+  .flush = mountfs_flush,
+  .fsync = mountfs_fsync,
+  .lseek = mountfs_lseek,
+  .read = mountfs_read,
+  .read_buf = mountfs_read_buf,
+  .write = mountfs_write,
+  .write_buf = mountfs_write_buf,
 
-    // Things
-    .create = mountfs_create,
-    .mknod = mountfs_mknod,
-    .mkdir = mountfs_mkdir,
-    .rmdir = mountfs_rmdir,
+  // Acts on directory handles only
+  .readdir = mountfs_readdir,
+  .fsyncdir = mountfs_fsyncdir,
 
-    // Allocation of files
-    .truncate = mountfs_truncate,
-    .fallocate = mountfs_fallocate,
-
-    // File link
-    .link = mountfs_link,
-    .unlink = mountfs_unlink,
-    .rename = mountfs_rename,
-    .symlink = mountfs_symlink,
-    .readlink = mountfs_readlink,
-
-    // File Seek/read/write
-    .lseek = mountfs_lseek,
-    .read = mountfs_read,
-    .write = mountfs_write,
-    .read_buf = mountfs_read_buf,
-    .write_buf = mountfs_write_buf,
-
-    // Misc file operations
-    .copy_file_range = mountfs_copy_file_range,
-
-    // Poll
-    .poll = NULL,
-
-    // Directory creation/removal/reading
-    .readdir = mountfs_readdir,
-
-    // Sync
-    .flush = mountfs_flush,
-    .fsync = mountfs_do_fsync,
-    .fsyncdir = mountfs_do_fsync,
-
-    // Misc
-    .utimens = mountfs_utimens,
-    .ioctl = NULL,
-
-    // Locking
-    .lock = NULL,
-    .flock = mountfs_flock,
+  // Unimplemented
+  .poll = NULL,
+  .ioctl = NULL,
+  .lock = NULL,
 };
 
 int main(int argc, char *argv[])
@@ -621,6 +706,8 @@ int main(int argc, char *argv[])
     argv[0][0] = '\0';
   }
 
+  qsort(options.mounts.items, options.mounts.count, sizeof options.mounts.items[0], mount_compar);
+
   fuse_opt_add_arg(&args, "-o");
   fuse_opt_add_arg(&args, "default_permissions");
 
@@ -628,3 +715,4 @@ int main(int argc, char *argv[])
   fuse_opt_free_args(&args);
   return result;
 }
+
