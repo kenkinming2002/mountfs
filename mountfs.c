@@ -720,6 +720,7 @@ static void setup(void)
 {
   qsort(options.mounts.items, options.mounts.count, sizeof options.mounts.items[0], mount_compar);
   raise_rlimit();
+  umask(0);
 }
 
 int main(int argc, char *argv[])
