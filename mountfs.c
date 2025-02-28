@@ -380,7 +380,7 @@ static int mountfs_release(const char *path, struct fuse_file_info *fi)
 
 static int mountfs_releasedir(const char *path, struct fuse_file_info *fi)
 {
-  if(fi->fh != SYNTHETIC_FH)
+  if(fi->fh == SYNTHETIC_FH)
     return 0;
 
   return close(fi->fh) != -1 ? 0 : -errno;
