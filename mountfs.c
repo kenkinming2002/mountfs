@@ -621,6 +621,9 @@ int main(int argc, char *argv[])
     argv[0][0] = '\0';
   }
 
+  fuse_opt_add_arg(&args, "-o");
+  fuse_opt_add_arg(&args, "default_permissions");
+
   int result = fuse_main(args.argc, args.argv, &mountfs_fops, NULL);
   fuse_opt_free_args(&args);
   return result;
