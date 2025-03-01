@@ -306,10 +306,36 @@ static bool path_may_synthesize(const char *path)
 /// Init or destroy ///
 ///////////////////////
 
+static void raise_rlimit(void)
+{
+  struct rlimit rlimit;
+  if(getrlimit(RLIMIT_NOFILE, &rlimit) == -1)
+  {
+    fprintf(stderr, "warning: failed to get rlimit for number of opened file descriptor\n");
+    return;
+  }
+
+  rlim_t old = rlimit.rlim_cur;
+  rlimit.rlim_cur = rlimit.rlim_max;
+
+  if(setrlimit(RLIMIT_NOFILE, &rlimit) == -1)
+  {
+    fprintf(stderr, "warning: failed to raise rlimit for number of opened file descriptor\n");
+    return;
+  }
+
+  fprintf(stderr, "raised rlimit for number of opened file descriptor from %jd to %jd\n", old, rlimit.rlim_cur);
+}
+
 static void *mountfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
   (void)conn;
   (void)cfg;
+
+  qsort(options.mounts.items, options.mounts.count, sizeof options.mounts.items[0], mount_compar);
+  raise_rlimit();
+  umask(0);
+
   return NULL;
 }
 
@@ -695,34 +721,6 @@ static struct fuse_operations mountfs_fops = {
   .lock = NULL,
 };
 
-static void raise_rlimit(void)
-{
-  struct rlimit rlimit;
-  if(getrlimit(RLIMIT_NOFILE, &rlimit) == -1)
-  {
-    fprintf(stderr, "warning: failed to get rlimit for number of opened file descriptor\n");
-    return;
-  }
-
-  rlim_t old = rlimit.rlim_cur;
-  rlimit.rlim_cur = rlimit.rlim_max;
-
-  if(setrlimit(RLIMIT_NOFILE, &rlimit) == -1)
-  {
-    fprintf(stderr, "warning: failed to raise rlimit for number of opened file descriptor\n");
-    return;
-  }
-
-  fprintf(stderr, "raised rlimit for number of opened file descriptor from %jd to %jd\n", old, rlimit.rlim_cur);
-}
-
-static void setup(void)
-{
-  qsort(options.mounts.items, options.mounts.count, sizeof options.mounts.items[0], mount_compar);
-  raise_rlimit();
-  umask(0);
-}
-
 int main(int argc, char *argv[])
 {
   struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
@@ -734,8 +732,6 @@ int main(int argc, char *argv[])
     help(argv[0]);
     argv[0][0] = '\0';
   }
-
-  setup();
 
   fuse_opt_add_arg(&args, "-o");
   fuse_opt_add_arg(&args, "default_permissions");
