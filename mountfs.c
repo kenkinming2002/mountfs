@@ -185,7 +185,7 @@ static const char *path_resolve(const char *path, char buffer[PATH_MAX+1])
 {
   // We loop in reverse because mounts are sorted by target length in ascending
   // order, and we only cares about the longest match
-  for(size_t i=options.mounts.count-1; i<options.mounts.count; ++i)
+  for(size_t i=options.mounts.count-1; i<options.mounts.count; --i)
   {
     struct mount *mount = &options.mounts.items[i];
     const char *rest = path_resolve_relative(mount->target, path);
@@ -208,7 +208,7 @@ static const char *path_resolve(const char *path, char buffer[PATH_MAX+1])
 
 static bool path_may_synthesize(const char *path)
 {
-  for(size_t i=0; i<options.mounts.count; --i)
+  for(size_t i=0; i<options.mounts.count; ++i)
   {
     const struct mount *mount = &options.mounts.items[i];
     if(path_resolve_relative(path, mount->target))
